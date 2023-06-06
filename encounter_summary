@@ -1,0 +1,134 @@
+#! /usr/bin/env python3
+
+"""
+Written by: <Alexander Burns> <z5118440>
+Written on: <18/04/2023>
+
+Encounter Summary
+
+This script prints a summary of all the Pokemon that can be encountered at a 
+given location in a given game. The summary includes the name, type(s), rarity, 
+minimum and maximum encounter levels, egg group(s), abilities, and encounter 
+requirements for each Pokemon.
+
+The output is ordered by rarity, name, maximum level, and requirements, with 
+egg group(s), abilities, and requirements alphabetically ordered. Hidden 
+abilities are excluded, and inverted requirements are marked with "NOT". Lines 
+for absent egg group(s) or abilities are omitted.
+
+"""
+
+import sys
+import psycopg2
+import helpers
+
+### Constants
+USAGE = f"Usage: {sys.argv[0]} <Location> <Game>"
+
+### Globals
+db = None
+Location = None
+Game = None
+
+### Command-line args
+if len(sys.argv) != 3:
+    print(USAGE, file=sys.stderr)
+    sys.exit(1)
+Location = helpers.clean(sys.argv[1])
+Game     = helpers.clean(sys.argv[2])
+
+def main():
+    # Connect to the database
+    cur = db.cursor()
+
+    # Validate location and game input
+    # Check if the given location exists in the database
+    cur.execute("SELECT ID FROM Locations WHERE Name = %s", (Location,))
+    location_id = cur.fetchone()
+    if not location_id:
+        print(f"'{Location}' isn't a location in the Pokemon series.", file=sys.stderr)
+        return
+
+    # Check if the given game exists in the database
+    cur.execute("SELECT ID FROM Games WHERE Name = %s", (Game,))
+    game_id = cur.fetchone()
+    if not game_id:
+        print(f"'Pokemon {Game}' isn't a game in the Pokemon series.", file=sys.stderr)
+        return
+
+    # Check if the location exists in the specified game
+    cur.execute("SELECT 1 FROM Locations l JOIN Games g ON g.ID = l.Appears_In WHERE l.Name = %s AND g.Name = %s", (Location, Game))
+    location_in_game = cur.fetchone()
+    if not location_in_game:
+        print(f"'{Location}' isn't in 'Pokemon {Game}'.", file=sys.stderr)
+        return
+
+    # Fetch the encounter summary for the given location and game 
+    # The query retrieves a range of fields, excluding hidden abilities and 
+    # including NOT requirements
+    cur.execute("""
+        SELECT e.ID AS Encounter_ID, p.Name, t1.Name AS Type1, COALESCE(t2.Name, '') AS Type2,
+                e.Rarity / 100.0 AS Rarity, (e.Levels).MIN AS Min_Level, (e.Levels).MAX AS Max_Level,
+                STRING_AGG(DISTINCT eg.Name, ', ' ORDER BY eg.Name) AS Egg_Groups,
+                STRING_AGG(DISTINCT a.Name, ', ' ORDER BY a.Name) AS Abilities,
+                STRING_AGG(r.Assertion, ', ' ORDER BY r.Assertion) AS Requirements
+        FROM Pokemon p
+        JOIN Types t1 ON p.First_Type = t1.ID
+        LEFT JOIN Types t2 ON p.Second_Type = t2.ID
+        JOIN Encounters e ON e.Occurs_With = p.ID
+        JOIN Locations l ON l.ID = e.Occurs_At
+        JOIN Games g ON g.ID = l.Appears_In
+        LEFT JOIN In_Group ig ON p.ID = ig.Pokemon
+        LEFT JOIN Egg_Groups eg ON ig.Egg_Group = eg.ID
+        LEFT JOIN Knowable_Abilities ka ON p.ID = ka.Known_By AND ka.Hidden = FALSE
+        LEFT JOIN Abilities a ON ka.Knows = a.ID
+        JOIN Encounter_Requirements er ON e.ID = er.Encounter
+        JOIN Requirements r ON er.Requirement = r.ID
+        WHERE g.Name = %s AND l.Name = %s
+        GROUP BY e.ID, p.Name, t1.Name, t2.Name, e.Rarity, e.Levels
+        ORDER BY e.Rarity DESC, p.Name ASC, (e.Levels).MAX ASC, (e.Levels).MIN ASC
+    """, (Game, Location))
+
+    encounters = cur.fetchall()
+
+    # Print the encounter summary for the specified location and game
+    print(f"\nIn 'Pokemon {Game}' at '{Location}' the following Pokemon can be Encountered:\n")
+
+    # Iterate through the encounters and format the output
+    for encounter in encounters:
+        # Allocate results from encounter tuple
+        encounter_id, name, type_1, type_2, rarity, min_level, max_level, egg_groups, abilities, requirements = encounter
+        # Format type, rarity percentage, unique abilities, and unique requirements
+        type_ = f"{type_1}/{type_2}" if type_2 else type_1
+        rarity_percentage = f"{rarity * 100:.0f}%"
+        abilities = abilities.split(', ')
+        unique_abilities = ', '.join(sorted(set(abilities), key=abilities.index))
+        requirements = [req.strip() for req in requirements.split(',')]
+        unique_requirements = '\n                    '.join(sorted(set(f"NOT {req[4:]}" if req.startswith("NOT ") else req for req in requirements), key=requirements.index))
+        
+        # Print formatted encounter information
+        print(f"        {name}:")
+        print(f"            Type: {type_}")
+        print(f"            Rarity: {rarity_percentage}")
+        print(f"            Levels: min {min_level}, max {max_level}")
+        # Consider cases where Pokemon isn't part of egg group or doesn't know abilities
+        if egg_groups and egg_groups.strip():
+            print(f"            Egg Groups: {egg_groups}")
+        if unique_abilities and unique_abilities.strip():
+            print(f"            Abilities: {unique_abilities}")
+        print("            Encounter Requirements:")
+        print(f"                    {unique_requirements}\n")
+
+if __name__ == '__main__':
+    try:
+        db = psycopg2.connect(dbname="ass2")
+        main()
+    except psycopg2.Error as err:
+        print("DB error: ", err)
+    except Exception as err:
+        print("Internal Error: ", err)
+        raise err
+    finally:
+        if db is not None:
+            db.close()
+    sys.exit(0)

@@ -1,0 +1,129 @@
+#! /usr/bin/env python3
+
+"""
+Written by: <Alexander Burns> <z5118440>
+Written on: <18/04/2023>
+
+Possible Evolutions
+
+Given the name of a pokemon as a command line argument, this script displays a 
+list of all the pokemon that could evolve into the given pokemon, and a list of
+all the pokemon that the given pokemon could evolve into. The requirements for 
+evolution are also included, with delineation between AND/OR requirements. 
+
+"""
+
+import sys
+import psycopg2
+import helpers
+
+### Constants
+USAGE = f"Usage: {sys.argv[0]} <Pokemon Name>"
+
+### Globals
+db = None
+Pokemon_Name = None
+
+### Command-line args
+if len(sys.argv) != 2:
+    print(USAGE, file=sys.stderr)
+    sys.exit(1)
+Pokemon_Name = helpers.clean(sys.argv[1])
+
+def main():  
+    with db.cursor() as cur:
+        
+        # Validate if given Pokemon name exists in database
+        cur.execute("SELECT ID FROM Pokemon WHERE Name = %s", (Pokemon_Name,))
+        pokemon_id_result = cur.fetchone()
+        if pokemon_id_result is None:
+            print(f"'{Pokemon_Name}' isn't a Pokemon that exists.", file=sys.stderr)
+            sys.exit(1)  
+        
+        # Extract the ID from the tuple
+        pokemon_id = pokemon_id_result[0]  
+
+        # Get Prevolutions (Pokemon which can evolve into the given Pokemon)
+        cur.execute("""
+        SELECT evo.ID, p.Name, req.Assertion, evo_req.Inverted
+        FROM Pokemon p
+        JOIN Evolutions evo ON p.ID = evo.Pre_Evolution
+        JOIN Evolution_Requirements evo_req ON evo.ID = evo_req.Evolution
+        JOIN Requirements req ON evo_req.Requirement = req.ID
+        WHERE evo.Post_Evolution = %s::pokemon_id
+        ORDER BY p.ID, evo.ID, req.ID, evo_req.Inverted DESC
+        """, (pokemon_id,))
+        prevolutions = cur.fetchall()
+
+        # Get Evolutions (Pokemon the given Pokemon can evolve into)
+        cur.execute("""
+        SELECT evo.ID, p.Name, req.Assertion, evo_req.Inverted
+        FROM Pokemon p
+        JOIN Evolutions evo ON p.ID = evo.Post_Evolution
+        JOIN Evolution_Requirements evo_req ON evo.ID = evo_req.Evolution
+        JOIN Requirements req ON evo_req.Requirement = req.ID
+        WHERE evo.Pre_Evolution = %s::pokemon_id
+        ORDER BY p.ID, evo.ID, req.ID, evo_req.Inverted DESC
+        """, (pokemon_id,))
+        evolutions = cur.fetchall()
+
+        # Print Prevolutions and the requirements to occur
+        if prevolutions:
+            prev_evo_id = None
+            prev_prevolution = None
+            print(f"'{Pokemon_Name}' can evolve from:")
+            for i, (evo_id, prevolution, requirement, inverted) in enumerate(prevolutions):
+                if evo_id != prev_evo_id:
+                    if prev_evo_id is not None:
+                        if prev_prevolution != prevolution:
+                            print()
+                        else:
+                            print("             OR")
+                    if prev_prevolution != prevolution:
+                        print(f"        '{prevolution}' when the following requirements are satisfied:")
+                    prev_evo_id = evo_id
+                    prev_prevolution = prevolution
+                else:
+                    print("             AND")
+                print(f"                {'NOT ' if inverted else ''}{requirement}")
+            print()
+        else:
+            print(f"'{Pokemon_Name}' doesn't have any pre-evolutions.")
+            print()
+
+        # Print Evolutions and the requirements to occur
+        if evolutions:
+            cur_evo_id = None
+            prev_evolution = None
+            print(f"'{Pokemon_Name}' can evolve into:")
+            for i, (evo_id, evolution, requirement, inverted) in enumerate(evolutions):
+                if evo_id != cur_evo_id:
+                    if cur_evo_id is not None:
+                        if prev_evolution != evolution:
+                            print()
+                        else:
+                            print("             OR")
+                    if prev_evolution != evolution:
+                        print(f"        '{evolution}' when the following requirements are satisfied:")
+                    cur_evo_id = evo_id
+                    prev_evolution = evolution
+                else:
+                    print("             AND")
+                print(f"                {'NOT ' if inverted else ''}{requirement}")
+            print()
+        else:
+            print(f"'{Pokemon_Name}' doesn't have any post-evolutions.")
+
+if __name__ == '__main__':
+    try:
+        db = psycopg2.connect(dbname="ass2")
+        main()
+    except psycopg2.Error as err:
+        print("DB error: ", err)
+    except Exception as err:
+        print("Internal Error: ", err)
+        raise err
+    finally:
+        if db is not None:
+            db.close()
+    sys.exit(0)

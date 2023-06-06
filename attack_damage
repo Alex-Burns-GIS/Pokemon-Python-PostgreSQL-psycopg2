@@ -1,0 +1,193 @@
+#! /usr/bin/env python3
+
+"""
+Written by: <Alexander Burns> <z5118440>
+Written on: <18/03/2023>
+
+Attack Damage
+
+Given both an attacking and defending pokemon, as well as the name of a Pokemon 
+game (as command line arguments), this script displays a list, ordered from 
+lowest to highest damage, of all the moves the attacking pokemon could use on 
+the defending pokemon in the given game.
+
+"""
+
+import sys
+import psycopg2
+import helpers
+
+### Constants
+USAGE = f"Usage: {sys.argv[0]} <Attacking Pokemon Name> <Defending Pokemon Name> <Pokemon Game Name>"
+
+### Globals
+db = None
+Attacking_Pokemon_Name = None
+Defending_Pokemon_Name = None
+Pokemon_Game_Name      = None
+
+### Command-line args
+if len(sys.argv) != 4:
+    print(USAGE, file=sys.stderr)
+    sys.exit(1)
+Attacking_Pokemon_Name = helpers.clean(sys.argv[1])
+Defending_Pokemon_Name = helpers.clean(sys.argv[2])
+Pokemon_Game_Name      = helpers.clean(sys.argv[3])
+
+def main():
+    cur = db.cursor()
+
+    # Validate game input
+    # Check if the first Pokemon exists in the database
+    cur.execute("SELECT ID FROM Pokemon WHERE Name = %s", (Attacking_Pokemon_Name,))
+    atk_pokemon_id = cur.fetchone()
+    if atk_pokemon_id is None:
+        print(f"'{Attacking_Pokemon_Name}' isn't a Pokemon that exists.", file=sys.stderr)
+        sys.exit(1)  
+
+    # Check if the second Pokemon exists in the database
+    cur.execute("SELECT ID FROM Pokemon WHERE Name = %s", (Defending_Pokemon_Name,))
+    def_pokemon_id = cur.fetchone()
+    if def_pokemon_id is None:
+        print(f"'{Defending_Pokemon_Name}' isn't a Pokemon that exists.", file=sys.stderr)
+        sys.exit(1)  
+
+    # Check if the given game exists in the database
+    cur.execute("SELECT ID FROM Games WHERE Name = %s", (Pokemon_Game_Name,))
+    game_id = cur.fetchone()
+    if not game_id:
+        print(f"'Pokemon {Pokemon_Game_Name}' isn't a game in the Pokemon series.", file=sys.stderr)
+        sys.exit(1)
+
+    # Check if the first Pokemon appears in the specified game
+    cur.execute("""
+        SELECT p.ID
+        FROM Pokemon p
+        JOIN Pokedex pd ON p.ID = pd.National_ID
+        JOIN Games g ON pd.Game = g.ID
+        WHERE p.Name = %s AND g.Name = %s
+    """, (Attacking_Pokemon_Name, Pokemon_Game_Name))
+    if not cur.fetchone():
+        print(f"'{Attacking_Pokemon_Name}' doesn't appear in 'Pokemon {Pokemon_Game_Name}'.", file=sys.stderr)
+        sys.exit(1)
+
+    # Check if the second Pokemon appears in the specified game
+    cur.execute("""
+        SELECT p.ID
+        FROM Pokemon p
+        JOIN Pokedex pd ON p.ID = pd.National_ID
+        JOIN Games g ON pd.Game = g.ID
+        WHERE p.Name = %s AND g.Name = %s
+    """, (Defending_Pokemon_Name, Pokemon_Game_Name))
+    if not cur.fetchone():
+        print(f"'{Defending_Pokemon_Name}' doesn't appear in 'Pokemon {Pokemon_Game_Name}'.", file=sys.stderr)
+        sys.exit(1)
+
+    # Fetch information about the attacking and defending Pokémon, their moves, and type effectiveness
+    # 
+    # SQL Info:
+    # WITH Attacker AS: Retrieves attacker's ID, Name, First_Type, Second_Type, Attack, and Special_Attack stats
+    # Defender AS: Retrieves defender's ID, Name, First_Type, Second_Type, Defense, and Special_Defense stats
+    # Attack_Details AS: Retrieves move details, including Name, Power, Category, Type, and effectiveness against defender's types
+    # SELECT DISTINCT: Combines Attacker, Defender, and Attack_Details info and calculates Type_Effectiveness and STAB
+
+    cur.execute("""
+        WITH Attacker AS (
+            SELECT p.ID, p.Name, t1.Name AS Type1, COALESCE(t2.Name, '') AS Type2,
+                CAST(SPLIT_PART(p.Base_Stats::text, ',', 2) AS INTEGER) AS Attack,
+                CAST(SPLIT_PART(p.Base_Stats::text, ',', 4) AS INTEGER) AS SpecialAttack
+            FROM Pokemon p
+            JOIN Types t1 ON p.First_Type = t1.ID
+            LEFT JOIN Types t2 ON p.Second_Type = t2.ID
+            WHERE p.Name = %s
+        ),
+        Defender AS (
+            SELECT p.ID, p.Name, t1.ID AS Type1_ID, t1.Name AS Type1,
+                COALESCE(t2.ID, NULL) AS Type2_ID, COALESCE(t2.Name, '') AS Type2,
+                CAST(SPLIT_PART(p.Base_Stats::text, ',', 3) AS INTEGER) AS Defense,
+                CAST(SPLIT_PART(p.Base_Stats::text, ',', 5) AS INTEGER) AS SpecialDefense
+            FROM Pokemon p
+            JOIN Types t1 ON p.First_Type = t1.ID
+            LEFT JOIN Types t2 ON p.Second_Type = t2.ID
+            WHERE p.Name = %s
+        ),
+        Attack_Details AS (
+            SELECT m.Name, m.Power, m.Category, tt.Name AS Type, te1.Multiplier AS Effectiveness1, te2.Multiplier AS Effectiveness2
+            FROM Moves m
+            JOIN Types tt ON m.Of_Type = tt.ID
+            JOIN Learnable_Moves lm ON lm.Learns = m.ID
+            JOIN Attacker a ON a.ID = lm.Learnt_By
+            JOIN Games g ON g.ID = lm.Learnt_In
+            LEFT JOIN Type_Effectiveness te1 ON te1.Attacking = tt.ID AND te1.Defending = (SELECT Type1_ID FROM Defender)
+            LEFT JOIN Type_Effectiveness te2 ON te2.Attacking = tt.ID AND te2.Defending = (SELECT Type2_ID FROM Defender)
+            WHERE m.Power IS NOT NULL AND g.Name = %s
+        )
+        SELECT DISTINCT ad.Name, ad.Power, ad.Category, ad.Type,
+            a.Type1 AS Attacker_Type1, a.Type2 AS Attacker_Type2,
+            a.Attack AS Attacker_Attack, a.SpecialAttack AS Attacker_SpecialAttack,
+            d.Type1 AS Defender_Type1, d.Type2 AS Defender_Type2,
+            d.Defense AS Defender_Defense, d.SpecialDefense AS Defender_SpecialDefense,
+            COALESCE(ad.Effectiveness1 / 100.0, 1) * COALESCE(ad.Effectiveness2 / 100.0, 1) AS Type_Effectiveness,
+            CASE
+                WHEN ad.Type = a.Type1 OR ad.Type = a.Type2 THEN 1.5
+                ELSE 1.0
+            END AS STAB
+        FROM Attack_Details ad, Attacker a, Defender d
+        ORDER BY Type_Effectiveness DESC, STAB DESC, ad.Power DESC, ad.Name
+    """, (Attacking_Pokemon_Name, Defending_Pokemon_Name, Pokemon_Game_Name))
+
+    move_details = cur.fetchall()
+    
+    # Check if the attacking Pokemon is unable to learn any moves that deal damage
+    if not move_details:
+        print(f"In 'Pokemon {Pokemon_Game_Name}', '{Attacking_Pokemon_Name}' can't attack '{Defending_Pokemon_Name}'.")
+        sys.exit(1)
+
+    # Calculate the minimum and maximum damage values for each move and store them in a list
+    damage_values = []
+    for move in move_details:
+        move_name, power, category, move_type, attacker_type1, attacker_type2, attacker_attack, attacker_special_attack, defender_type1, defender_type2, defender_defense, defender_special_defense, type_effectiveness, stab = move
+
+        attack_stat = attacker_attack if category == 'Physical' else attacker_special_attack
+        defense_stat = defender_defense if category == 'Physical' else defender_special_defense
+
+        # Calculate minimum damage
+        min_damage = (((((2 * 1) / 5) + 2) * power * (float(attack_stat) / float(defense_stat))) / 50) + 2
+        min_damage *= 0.85 * float(stab) * float(type_effectiveness)
+        min_damage = int(round(min_damage, 1))
+
+        # Calculate maximum damage
+        max_damage = (((((2 * 100) / 5) + 2) * power * (float(attack_stat) / float(defense_stat))) / 50) + 2
+        max_damage *= 1.0 * float(stab) * float(type_effectiveness)
+        max_damage = int(round(max_damage, 1))
+        
+        if max_damage > 0:
+            damage_values.append((move_name, min_damage, max_damage))
+
+    # Sort the damage values list
+    damage_values.sort(key=lambda x: (x[2], x[1], x[0]))
+
+    # Check if the attacking Pokemon deals 0 damage
+    if not damage_values:
+        print(f"In 'Pokemon {Pokemon_Game_Name}', '{Attacking_Pokemon_Name}' can't attack '{Defending_Pokemon_Name}'.")
+        sys.exit(1)
+
+    # Print list of moves the attacking pokemon can use on the defending pokemon
+    print(f"\nIn 'Pokemon {Pokemon_Game_Name}', When '{Attacking_Pokemon_Name}' attacks '{Defending_Pokemon_Name}', '{Attacking_Pokemon_Name}' can use the following moves:\n")
+    for move_name, min_damage, max_damage in damage_values:
+        print(f"\t'{move_name}' for a minimum of {min_damage} damage and a maximum of {max_damage} damage to '{Defending_Pokemon_Name}'.")
+    print()
+
+if __name__ == '__main__':
+    try:
+        db = psycopg2.connect(dbname="ass2")
+        main()
+    except psycopg2.Error as err:
+        print("DB error: ", err)
+    except Exception as err:
+        print("Internal Error: ", err)
+        raise err
+    finally:
+        if db is not None:
+            db.close()
+    sys.exit(0)

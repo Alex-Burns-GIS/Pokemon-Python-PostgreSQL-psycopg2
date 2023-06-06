@@ -1,0 +1,119 @@
+#! /usr/bin/env python3
+
+"""
+Written by: <Alexander Burns> <z5118440>
+Written on: <18/04/2023>
+
+Pokemon Density
+
+This script takes the name of a region as a command line argument and calculates 
+the average density of Pokemon in each location within that region. It then 
+outputs the locations sorted by their Pokemon density and separately lists 
+locations with no wild Pokemon encounters.
+
+"""
+
+import sys
+import psycopg2
+import helpers
+import math
+
+### Constants
+USAGE = f"Usage: {sys.argv[0]} <Region>"
+
+### Globals
+db = None
+Region = None
+
+### Command-line args
+if len(sys.argv) != 2:
+    print(USAGE, file=sys.stderr)
+    sys.exit(1)
+Region = helpers.clean(sys.argv[1])
+
+def main():
+    cur = db.cursor()
+
+    # Fetch all available regions using the enum_range function
+    cur.execute("SELECT unnest(enum_range(NULL::Regions))")
+    available_regions = [region[0] for region in cur.fetchall()]
+
+    # Check if the given region exists
+    if Region not in available_regions:
+        print(f"'{Region}' isn\'t a region in the Pokemon series.", file=sys.stderr)
+        return
+
+    # Fetch all locations for the given region
+    cur.execute("""
+        SELECT DISTINCT loc.Name
+        FROM Locations loc
+        JOIN Games g ON g.ID = loc.Appears_In
+        WHERE g.Region = %s
+        ORDER BY loc.Name
+    """, (Region,))
+
+    locations = cur.fetchall()
+    location_density = []
+    no_encounter_locations = []
+
+    # Calculate the average density for each location
+    for location in locations:
+        location_name = location[0]
+
+        # Fetch all games for the given region
+        cur.execute("""
+            SELECT g.ID, g.Name
+            FROM Games g
+            WHERE g.Region = %s
+        """, (Region,))
+        games = cur.fetchall()
+
+        densities = []
+        # Calculate the density of Pokemon for each game in the location
+        for game_id, game_name in games:
+            cur.execute("""
+                SELECT SUM((p.Average_Weight * 1000 / (((4.0 / 3.0) * 3.141592653589793 * POWER(((p.Average_Height * 100) / 2), 3)))) * (s.Rarity / 100.0)) as Density
+                FROM Locations loc
+                JOIN Encounters s ON s.Occurs_At = loc.ID
+                JOIN Pokemon p ON p.ID = s.Occurs_With
+                WHERE loc.Appears_In = %s AND loc.Name = %s
+            """, (game_id, location_name))
+
+            density = cur.fetchone()[0]
+            if density is not None:
+                densities.append(density)
+
+        # Calculate the average density for the location
+        if densities:
+            average_density = sum(densities) / len(densities)
+            location_density.append((location_name, average_density))
+        else:
+            no_encounter_locations.append(location_name)
+
+    # Using lambda key function, sort by density, then by location name
+    location_density.sort(key=lambda x: (-x[1], x[0]))
+
+    # Display the average density of Pokemon for each location in the given region
+    print(f"\nThe average density of Pokemon within each location in the '{Region}' region:\n")
+    for location_name, average_density in location_density:
+        print(f"{location_name}: {average_density:.4f}")
+
+    # Display the locations with no wild Pokémon encounters in the given region
+    print(f"\nThe following locations in the '{Region}' region have no wild Pokemon encounters:\n")
+    for location_name in no_encounter_locations:
+        print(f"{location_name}")
+    print()
+
+if __name__ == '__main__':
+    try:
+        db = psycopg2.connect(dbname="ass2")
+        main()
+    except psycopg2.Error as err:
+        print("DB error: ", err)
+    except Exception as err:
+        print("Internal Error: ", err)
+        raise err
+    finally:
+        if db is not None:
+            db.close()
+    sys.exit(0)
